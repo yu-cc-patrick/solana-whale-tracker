@@ -275,7 +275,7 @@ def check_matured_tokens(tokens_db: dict) -> list:
 
 def fetch_top_holders(mint_address: str) -> list:
     """兼容旧接口，委托给 solana_utils.fetch_real_holders"""
-    return fetch_real_holders(mint_address, top_n=TOP_N)
+    return fetch_real_holders(mint_address, top_n=TOP_N, max_txn_per_day=10)
 
 
 # ============================================================

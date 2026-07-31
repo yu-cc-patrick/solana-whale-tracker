@@ -88,8 +88,10 @@ def b58encode(data: bytes) -> str:
 # RPC 调用
 # ============================================================
 
-def _rpc(method: str, params: list[Any], rpc_url: str | None = None) -> dict:
-    """底层 JSON-RPC 调用"""
+def _rpc(method: str, params: list[Any], rpc_url: str | None = None,
+         retries: int = 2) -> dict:
+    """底层 JSON-RPC 调用，自动重试"""
+    import time as _time
     url = rpc_url or DEFAULT_RPC
     if not url:
         raise ValueError("未配置 SOLANA_RPC_URL")
@@ -97,12 +99,20 @@ def _rpc(method: str, params: list[Any], rpc_url: str | None = None) -> dict:
         "jsonrpc": "2.0", "id": 1,
         "method": method, "params": params,
     }).encode()
-    req = urllib.request.Request(url, data=payload, headers={
-        "Content-Type": "application/json",
-        "User-Agent": "solana-utils/1.0",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=payload, headers={
+                "Content-Type": "application/json",
+                "User-Agent": "solana-utils/1.0",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                _time.sleep(1 * (attempt + 1))  # 递增等待
+    raise last_err
 
 
 # ============================================================
@@ -190,37 +200,120 @@ def is_real_wallet(
 
 
 # ============================================================
-# 一站式方法 — 这就是你要的底层筛选
+# 交易频率检查 — 排除高频机器人
+# ============================================================
+
+def check_wallet_activity(
+    addresses: list[str],
+    max_txn_per_day: int = 10,
+    rpc_url: str | None = None,
+) -> dict[str, dict]:
+    """
+    批量检查地址的链上活跃度，识别高频机器人
+
+    对每个地址调 getSignaturesForAddress(limit=100)，
+    统计最近24小时内的交易数。
+
+    返回: {
+      地址: {
+        "total_txn": 100,          # 获取的签名总数
+        "txn_24h": 15,             # 最近24h交易数
+        "is_low_frequency": False, # 是否是低频地址（日交易≤阈值）
+        "first_txn_age_hours": 72.3, # 最早一笔交易距今多久
+      }
+    }
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if not addresses:
+        return {}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    results: dict[str, dict] = {}
+
+    for addr in addresses:
+        try:
+            data = _rpc("getSignaturesForAddress", [
+                addr,
+                {"limit": 100},
+            ], rpc_url)
+            sigs = data.get("result", [])
+            total = len(sigs)
+
+            # 统计最近24h内交易数
+            txn_24h = 0
+            first_ts = None
+            for s in sigs:
+                bt = s.get("blockTime")
+                if bt:
+                    dt = datetime.fromtimestamp(bt, tz=timezone.utc)
+                    if first_ts is None:
+                        first_ts = dt
+                    if dt > cutoff:
+                        txn_24h += 1
+
+            # 最早交易距今多久
+            first_age_hours = None
+            if first_ts:
+                first_age_hours = round(
+                    (datetime.now(timezone.utc) - first_ts).total_seconds() / 3600, 1
+                )
+
+            is_low_freq = txn_24h <= max_txn_per_day
+
+            results[addr] = {
+                "total_txn": total,
+                "txn_24h": txn_24h,
+                "is_low_frequency": is_low_freq,
+                "first_txn_age_hours": first_age_hours,
+            }
+        except Exception:
+            # 查询失败保守排除
+            results[addr] = {
+                "total_txn": 0,
+                "txn_24h": 999,
+                "is_low_frequency": False,
+                "first_txn_age_hours": None,
+            }
+
+    return results
+
+
+# ============================================================
+# 一站式方法 — 真正的庄钱包
 # ============================================================
 
 def fetch_real_holders(
     mint: str,
     top_n: int = 20,
+    max_txn_per_day: int = 10,
     rpc_url: str | None = None,
 ) -> list[dict]:
     """
-    获取代币前N大持仓中真正的个人钱包（庄钱包）
+    获取代币前N大持仓中真正的个人庄钱包
 
-    三步筛选:
+    四步筛选:
       1. getTokenLargestAccounts → 代币账户地址
       2. 解析每个ATA的 owner 地址
-      3. 验证 owner 是否是 System Program（真正钱包）
-      4. 只返回通过验证的
+      3. 验证 owner == System Program（排除DEX合约/AMM等）
+      4. 验证 日交易 ≤ max_txn_per_day（排除高频机器人/做市商/sniper bot）
 
     返回: [
       {
-        "rank": 1,           # 排名(仅包含真钱包)
-        "address": "xxx",    # 真正钱包地址
-        "ata": "xxx",        # 代币账户地址(用于链上验证)
-        "amount": 123456.78, # 持仓数量
-        "amount_raw": "xxx", # 原始数量
-        "is_real_wallet": True,
+        "rank": 1,
+        "address": "xxx",        # 真正钱包地址
+        "ata": "xxx",            # 代币账户地址(链上验证用)
+        "amount": 123456.78,     # 持仓数量
+        "amount_raw": "xxx",     # 原始数量
+        "is_real_wallet": True,  # 通过System Program验证
+        "txn_24h": 3,            # 最近24h交易数
+        "is_low_frequency": True,# 低频地址
       }, ...
     ]
 
     用法:
       from solana_utils import fetch_real_holders
-      holders = fetch_real_holders("token_mint_address", top_n=20)
+      holders = fetch_real_holders("token_mint", top_n=20, max_txn_per_day=10)
     """
     if not rpc_url:
         rpc_url = DEFAULT_RPC
@@ -239,19 +332,28 @@ def fetch_real_holders(
     ata_addrs = [t["address"] for t in candidates]
     ata_to_owner = resolve_ata_owners(ata_addrs, rpc_url)
 
-    # Step 3: 验证哪些 owner 是真钱包
+    # Step 3: 验证哪些 owner 是真钱包（System Program）
     all_owners = list(set(ata_to_owner.values()))
     wallet_check = is_real_wallet(all_owners, rpc_url)
 
-    # Step 4: 只保留真钱包
+    # Step 4: 验证低频交易（排除机器人/做市商/sniper bot）
+    real_owners = [o for o in all_owners if wallet_check.get(o, False)]
+    frequency_check = check_wallet_activity(real_owners, max_txn_per_day, rpc_url)
+
+    # Step 5: 只保留真钱包 + 低频
     real: list[dict] = []
     for item in candidates:
         ata = item["address"]
         owner = ata_to_owner.get(ata)
         if not owner:
             continue
+        # 过滤1: System Program
         if not wallet_check.get(owner, False):
-            continue  # ❌ 不是真钱包，跳过
+            continue
+        # 过滤2: 低频交易
+        freq = frequency_check.get(owner, {})
+        if not freq.get("is_low_frequency", False):
+            continue
 
         dec = item.get("decimals", 0)
         amt_raw = item["amount"]
@@ -266,6 +368,8 @@ def fetch_real_holders(
             "amount": round(amt, 2),
             "amount_raw": amt_raw,
             "is_real_wallet": True,
+            "txn_24h": freq.get("txn_24h", 0),
+            "is_low_frequency": freq.get("is_low_frequency", False),
         })
 
         if len(real) >= top_n:
