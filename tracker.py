@@ -28,6 +28,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from solana_utils import fetch_real_holders, SYSTEM_PROGRAM
+
 
 def _load_dotenv() -> None:
     """把 .env 文件加载到环境变量（不覆盖已有值）"""
@@ -264,86 +266,16 @@ def check_matured_tokens(tokens_db: dict) -> list:
 
 
 # ============================================================
-# base58 编解码 (纯Python实现，零依赖)
+# Step 3: 收集前20持仓 — 委托给 solana_utils
 # ============================================================
 
-_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-def _b58encode(data: bytes) -> str:
-    """Base58 编码 bytes → Solana地址格式"""
-    if not data:
-        return ""
-    zeros = 0
-    for b in data:
-        if b == 0:
-            zeros += 1
-        else:
-            break
-    n = int.from_bytes(data, "big")
-    chars = []
-    while n > 0:
-        n, rem = divmod(n, 58)
-        chars.append(_ALPHABET[rem])
-    return "1" * zeros + "".join(chr(c) for c in reversed(chars))
-
-
-# ============================================================
-# Step 3: 收集前20持仓
-# ============================================================
+# fetch_real_holders 在文件顶部 import，直接使用即可
+# 它自动过滤非 System Program 的假地址（DEX池、Pump.fun AMM等）
+# 返回的都是真正的个人钱包
 
 def fetch_top_holders(mint_address: str) -> list:
-    """获取token前TOP_N持仓的**真正钱包地址**（解析代币账户owner）"""
-    if not SOLANA_RPC:
-        return []
-    try:
-        # Step A: getTokenLargestAccounts → 代币账户地址
-        data = http_post(SOLANA_RPC, {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTokenLargestAccounts",
-            "params": [mint_address],
-        })
-        token_accounts = data.get("result", {}).get("value") or []
-        if not token_accounts:
-            return []
-
-        # Step B: 批量查代币账户的 owner → 一次RPC
-        ta_addrs = [item["address"] for item in token_accounts[:TOP_N]]
-        acct_data = http_post(SOLANA_RPC, {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [ta_addrs, {"encoding": "base64"}],
-        })
-        acct_infos = acct_data.get("result", {}).get("value") or []
-
-        # Step C: 解析 base64 数据 → 提取真正的钱包owner
-        import base64 as _b64
-        holders = []
-        for i, (item, acct) in enumerate(zip(token_accounts[:TOP_N], acct_infos)):
-            token_account = item["address"]
-            dec = item.get("decimals", 0)
-            amt = float(item["amount"])
-            if dec > 0:
-                amt /= (10 ** dec)
-
-            # 从 base64 数据中提取 owner pubkey (bytes 32-63)
-            raw = acct.get("data", [])
-            real_owner = ""
-            if raw and len(raw) > 0 and isinstance(raw[0], str):
-                decoded = _b64.b64decode(raw[0])
-                if len(decoded) >= 64:
-                    real_owner = _b58encode(decoded[32:64])
-
-            holders.append({
-                "rank": i + 1,
-                "address": real_owner or token_account,  # 真正钱包地址
-                "token_account": token_account,           # 代币账户(用于链上验证)
-                "amount_raw": item["amount"],
-                "amount": round(amt, 2),
-            })
-        return holders
-    except Exception as e:
-        log(f"    RPC失败 {mint_address[:10]}...: {e}")
-        return []
+    """兼容旧接口，委托给 solana_utils.fetch_real_holders"""
+    return fetch_real_holders(mint_address, top_n=TOP_N)
 
 
 # ============================================================
