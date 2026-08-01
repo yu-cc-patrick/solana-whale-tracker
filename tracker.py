@@ -66,7 +66,7 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MIN_MCAP = 300_000          # $300K
-MATURE_HOURS = 6            # 存活满6小时才检查
+MIN_HOLDER_USD = 5_000     # 单个地址持仓USD价值门槛
 TOP_N = 20                  # 每个币收集前N持仓
 BATCH_SIZE = 30             # 每批最多查N个token info
 BATCH_SLEEP = 2             # 批次间等待(秒)
@@ -374,9 +374,18 @@ def main() -> None:
         holders = fetch_top_holders(addr)
         if not holders:
             continue
+
+        # 估算每个地址的USD价值 = market_cap × (amount / total_supply_approx)
+        total_held = sum(h["amount"] for h in holders)
         n_this = 0
         for h in holders:
             ha = h["address"]
+            usd_value = (h["amount"] / total_held * ti["market_cap"]) if total_held > 0 else 0
+
+            # 过滤: 持仓USD价值低于门槛
+            if usd_value < MIN_HOLDER_USD:
+                continue
+
             if ha not in holders_db:
                 holders_db[ha] = {
                     "first_seen_with": addr,
@@ -385,7 +394,8 @@ def main() -> None:
                     "tokens": [addr],
                 }
                 all_new.append({**h, "token_symbol": ti["symbol"],
-                                "token_address": addr, "market_cap": ti["market_cap"]})
+                                "token_address": addr, "market_cap": ti["market_cap"],
+                                "usd_value": round(usd_value, 2)})
                 n_this += 1
             else:
                 holders_db[ha]["appearances"] += 1
@@ -394,7 +404,7 @@ def main() -> None:
         tokens_db[addr]["holders_collected"] = True
         tokens_db[addr]["status"] = "collected"
         if n_this:
-            log(f"  {ti['symbol'] or addr[:10]}: +{n_this}新地址 MCap${ti['market_cap']:,.0f}")
+            log(f"  {ti['symbol'] or addr[:10]}: +{n_this}新地址 (≥${MIN_HOLDER_USD}) MCap${ti['market_cap']:,.0f}")
 
     save_json(HOLDERS_FILE, {"holders": holders_db, "updated_at": now_iso()})
     save_json(TOKENS_FILE, tokens_db)
