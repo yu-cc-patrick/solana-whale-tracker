@@ -66,7 +66,9 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MIN_MCAP = 300_000          # $300K
-MIN_HOLDER_USD = 5_000     # 单个地址持仓USD价值门槛
+MATURE_HOURS = 6            # 代币至少存活6小时
+MIN_HOLDER_USD = 10_000    # 单个地址持仓USD价值门槛
+MAX_TOKEN_COUNT = 20       # 钱包交互币种数上限(排除高频地址)
 TOP_N = 20                  # 每个币收集前N持仓
 BATCH_SIZE = 30             # 每批最多查N个token info
 BATCH_SLEEP = 2             # 批次间等待(秒)
@@ -275,7 +277,9 @@ def check_matured_tokens(tokens_db: dict) -> list:
 
 def fetch_top_holders(mint_address: str) -> list:
     """兼容旧接口，委托给 solana_utils.fetch_real_holders"""
-    return fetch_real_holders(mint_address, top_n=TOP_N, max_txn_per_day=10)
+    return fetch_real_holders(mint_address, top_n=TOP_N,
+                              max_txn_per_day=10,
+                              max_token_interactions=MAX_TOKEN_COUNT)
 
 
 # ============================================================
