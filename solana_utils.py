@@ -200,6 +200,58 @@ def is_real_wallet(
 
 
 # ============================================================
+# 钱包行为分析
+# ============================================================
+
+def count_token_interactions(address: str, max_check: int = 21,
+                            rpc_url: str | None = None) -> int:
+    """
+    快速检查钱包交互过的代币种类数。
+    用 limit=max_check+1 截断: 如果返回 >= max_check+1 说明"至少这么多"。
+    这样避免了拉取海王地址的几千条记录。
+    """
+    total = 0
+    for program_id in [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]:
+        try:
+            data = _rpc("getTokenAccountsByOwner", [
+                address,
+                {"programId": program_id},
+                {"encoding": "base64"},
+                {"limit": max_check + 1},  # 截断
+            ], rpc_url)
+            accts = data.get("result", {}).get("value") or []
+            total += len(accts)
+            if total > max_check:
+                return total  # 已经超了，不用继续
+        except Exception:
+            pass
+    return total
+
+
+def filter_low_token_count(
+    addresses: list[str],
+    max_tokens: int = 20,
+    rpc_url: str | None = None,
+) -> dict[str, dict]:
+    """
+    批量检查地址的交互币种数，排除"太花心"的地址
+
+    返回: {地址: {"token_count": N, "is_focused": True/False}}
+    """
+    results: dict[str, dict] = {}
+    for addr in addresses:
+        try:
+            count = count_token_interactions(addr, rpc_url)
+            results[addr] = {
+                "token_count": count,
+                "is_focused": count <= max_tokens,
+            }
+        except Exception:
+            results[addr] = {"token_count": 999, "is_focused": False}
+    return results
+
+
+# ============================================================
 # 交易频率检查 — 排除高频机器人
 # ============================================================
 
@@ -287,6 +339,7 @@ def fetch_real_holders(
     mint: str,
     top_n: int = 20,
     max_txn_per_day: int = 10,
+    max_token_interactions: int = 20,
     rpc_url: str | None = None,
 ) -> list[dict]:
     """
@@ -325,8 +378,8 @@ def fetch_real_holders(
     if not token_accounts:
         return []
 
-    # 只取前 top_n*3 个 ATA（因为后面要过滤掉假的，多取一些确保够）
-    candidates = token_accounts[:max(top_n * 3, 30)]
+    # 只取前 top_n 个 ATA — 不强凑
+    candidates = token_accounts[:top_n]
 
     # Step 2: 解析 owner
     ata_addrs = [t["address"] for t in candidates]
@@ -336,23 +389,27 @@ def fetch_real_holders(
     all_owners = list(set(ata_to_owner.values()))
     wallet_check = is_real_wallet(all_owners, rpc_url)
 
-    # Step 4: 验证低频交易（排除机器人/做市商/sniper bot）
+    # Step 4: 验证低频交易
     real_owners = [o for o in all_owners if wallet_check.get(o, False)]
     frequency_check = check_wallet_activity(real_owners, max_txn_per_day, rpc_url)
 
-    # Step 5: 只保留真钱包 + 低频
+    # Step 5: 验证交互币种数
+    token_count_check = filter_low_token_count(real_owners, max_token_interactions, rpc_url)
+
+    # Step 6: 组合过滤
     real: list[dict] = []
     for item in candidates:
         ata = item["address"]
         owner = ata_to_owner.get(ata)
         if not owner:
             continue
-        # 过滤1: System Program
         if not wallet_check.get(owner, False):
             continue
-        # 过滤2: 低频交易
         freq = frequency_check.get(owner, {})
         if not freq.get("is_low_frequency", False):
+            continue
+        tkc = token_count_check.get(owner, {})
+        if not tkc.get("is_focused", False):
             continue
 
         dec = item.get("decimals", 0)
@@ -370,6 +427,8 @@ def fetch_real_holders(
             "is_real_wallet": True,
             "txn_24h": freq.get("txn_24h", 0),
             "is_low_frequency": freq.get("is_low_frequency", False),
+            "token_count": tkc.get("token_count", 0),
+            "is_focused": tkc.get("is_focused", False),
         })
 
         if len(real) >= top_n:
